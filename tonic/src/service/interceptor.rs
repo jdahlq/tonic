@@ -3,6 +3,8 @@
 //! See [`Interceptor`] for more details.
 
 use crate::{request::SanitizeHeaders, Status};
+use async_trait::async_trait;
+use futures_util::{FutureExt,};
 use pin_project::pin_project;
 use std::{
     fmt,
@@ -52,6 +54,28 @@ where
     }
 }
 
+/// Async version of `Interceptor`.
+#[async_trait]
+pub trait AsyncInterceptor {
+    /// The Future returned by the interceptor.
+    type Future: Future<Output = Result<crate::Request<()>, Status>>;
+    /// Intercept a request before it is sent, optionally cancelling it.
+    fn call(&mut self, request: crate::Request<()>) -> Self::Future;
+}
+
+#[async_trait]
+impl<F, U> AsyncInterceptor for F
+    where
+        F: FnMut(crate::Request<()>) -> U,
+        U: Future<Output = Result<crate::Request<()>, Status>>,
+{
+    type Future = U;
+
+    fn call(&mut self, request: crate::Request<()>) -> Self::Future {
+        self(request)
+    }
+}
+
 /// Create a new interceptor layer.
 ///
 /// See [`Interceptor`] for more details.
@@ -60,6 +84,16 @@ where
     F: Interceptor,
 {
     InterceptorLayer { f }
+}
+
+/// Create a new async interceptor layer.
+///
+/// See [`AsyncInterceptor`] and [`Interceptor`] for more details.
+pub fn async_interceptor<F>(f: F) -> AsyncInterceptorLayer<F>
+where
+    F: AsyncInterceptor,
+{
+    AsyncInterceptorLayer { f }
 }
 
 #[deprecated(
@@ -87,12 +121,34 @@ pub struct InterceptorLayer<F> {
 
 impl<S, F> Layer<S> for InterceptorLayer<F>
 where
+    S: Clone,
     F: Interceptor + Clone,
 {
     type Service = InterceptedService<S, F>;
 
     fn layer(&self, service: S) -> Self::Service {
         InterceptedService::new(service, self.f.clone())
+    }
+}
+
+/// A gRPC async interceptor that can be used as a [`Layer`],
+/// created by calling [`async_interceptor`].
+///
+/// See [`AsyncInterceptor`] for more details.
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncInterceptorLayer<F> {
+    f: F,
+}
+
+impl<S, F> Layer<S> for AsyncInterceptorLayer<F>
+    where
+        S: Clone,
+        F: AsyncInterceptor + Clone,
+{
+    type Service = AsyncInterceptedService<S, F>;
+
+    fn layer(&self, service: S) -> Self::Service {
+        AsyncInterceptedService::new(service, self.f.clone())
     }
 }
 
@@ -173,11 +229,97 @@ where
     }
 }
 
+/// A service wrapped in an async interceptor middleware.
+///
+/// See [`AsyncInterceptor`] for more details.
+#[derive(Clone, Copy)]
+pub struct AsyncInterceptedService<S, F>
+{
+    inner: S,
+    f: F,
+}
+
+impl<S, F> AsyncInterceptedService<S, F> {
+    /// Create a new `AsyncInterceptedService` that wraps `S` and intercepts each request with the
+    /// function `F`.
+    pub fn new(service: S, f: F) -> Self
+        where
+            F: AsyncInterceptor,
+    {
+        Self { inner: service, f }
+    }
+}
+
+impl<S, F> fmt::Debug for AsyncInterceptedService<S, F>
+    where
+        S: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InterceptedService")
+            .field("inner", &self.inner)
+            .field("f", &format_args!("{}", std::any::type_name::<F>()))
+            .finish()
+    }
+}
+
+impl<S, F, ReqBody, ResBody> Service<http::Request<ReqBody>> for AsyncInterceptedService<S, F>
+    where
+        F: AsyncInterceptor + Clone + Send + 'static,
+        F::Future: Send,
+        S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
+        S::Error: Into<crate::Error>,
+        S::Future: Send,
+        ReqBody: 'static + Send,
+{
+    type Response = http::Response<ResBody>;
+    type Error = crate::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<http::Response<ResBody>, crate::Error>> + Send>>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+        let uri = req.uri().clone();
+        let req = crate::Request::from_http(req);
+        let (metadata, extensions, msg) = req.into_parts();
+
+        let inner = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, inner);
+
+
+
+        Box::pin(self.f
+            .call(crate::Request::from_parts(metadata, extensions, ()))
+            .then(move |intercepted_req| {
+                match intercepted_req {
+                    Ok(req) => {
+                        let (metadata, extensions, _) = req.into_parts();
+                        let req = crate::Request::from_parts(metadata, extensions, msg);
+                        let req = req.into_http(uri, SanitizeHeaders::No);
+                        ResponseFuture::future(inner.call(req))
+                    }
+                    Err(status) => ResponseFuture::error(status),
+                }
+            }))
+    }
+}
+
 // required to use `InterceptedService` with `Router`
 #[cfg(feature = "transport")]
 impl<S, F> crate::transport::NamedService for InterceptedService<S, F>
 where
     S: crate::transport::NamedService,
+{
+    const NAME: &'static str = S::NAME;
+}
+
+// required to use `AsyncInterceptedService` with `Router`
+#[cfg(feature = "transport")]
+impl<S, F> crate::transport::NamedService for AsyncInterceptedService<S, F>
+    where
+        S: crate::transport::NamedService,
 {
     const NAME: &'static str = S::NAME;
 }
