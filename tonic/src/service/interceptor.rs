@@ -12,6 +12,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+use std::marker::PhantomData;
 use tower_layer::Layer;
 use tower_service::Service;
 
@@ -89,11 +90,11 @@ where
 /// Create a new async interceptor layer.
 ///
 /// See [`AsyncInterceptor`] and [`Interceptor`] for more details.
-pub fn async_interceptor<F>(f: F) -> AsyncInterceptorLayer<F>
+pub fn async_interceptor<'a, F>(f: F) -> AsyncInterceptorLayer<'a, F>
 where
     F: AsyncInterceptor,
 {
-    AsyncInterceptorLayer { f }
+    AsyncInterceptorLayer { f, _marker: PhantomData }
 }
 
 #[deprecated(
@@ -136,16 +137,18 @@ where
 ///
 /// See [`AsyncInterceptor`] for more details.
 #[derive(Debug, Clone, Copy)]
-pub struct AsyncInterceptorLayer<F> {
+pub struct AsyncInterceptorLayer<'a, F>
+{
     f: F,
+    _marker: PhantomData<&'a F>
 }
 
-impl<S, F> Layer<S> for AsyncInterceptorLayer<F>
+impl<'a, S, F> Layer<S> for AsyncInterceptorLayer<'a, F>
     where
-        S: Clone,
+        S: Clone + 'a,
         F: AsyncInterceptor + Clone,
 {
-    type Service = AsyncInterceptedService<S, F>;
+    type Service = AsyncInterceptedService<'a, S, F>;
 
     fn layer(&self, service: S) -> Self::Service {
         AsyncInterceptedService::new(service, self.f.clone())
@@ -233,24 +236,23 @@ where
 ///
 /// See [`AsyncInterceptor`] for more details.
 #[derive(Clone, Copy)]
-pub struct AsyncInterceptedService<S, F>
+pub struct AsyncInterceptedService<'a, S: 'a, F>
 {
     inner: S,
     f: F,
+    _marker: PhantomData<&'a F>,
 }
 
-impl<S, F> AsyncInterceptedService<S, F> {
+impl<'a, S, F> AsyncInterceptedService<'a, S, F> {
     /// Create a new `AsyncInterceptedService` that wraps `S` and intercepts each request with the
     /// function `F`.
     pub fn new(service: S, f: F) -> Self
-        where
-            F: AsyncInterceptor,
     {
-        Self { inner: service, f }
+        Self { inner: service, f, _marker: PhantomData }
     }
 }
 
-impl<S, F> fmt::Debug for AsyncInterceptedService<S, F>
+impl<'a, S, F> fmt::Debug for AsyncInterceptedService<'a, S, F>
     where
         S: fmt::Debug,
 {
@@ -262,18 +264,18 @@ impl<S, F> fmt::Debug for AsyncInterceptedService<S, F>
     }
 }
 
-impl<S, F, ReqBody, ResBody> Service<http::Request<ReqBody>> for AsyncInterceptedService<S, F>
+impl<'a, S, F, ReqBody, ResBody> Service<http::Request<ReqBody>> for AsyncInterceptedService<'a, S, F>
     where
-        F: AsyncInterceptor + Clone + Send + 'static,
+        F: AsyncInterceptor + Clone + Send + 'a,
         F::Future: Send,
-        S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
+        S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'a,
         S::Error: Into<crate::Error>,
         S::Future: Send,
-        ReqBody: 'static + Send,
+        ReqBody: 'a + Send,
 {
     type Response = http::Response<ResBody>;
     type Error = crate::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<http::Response<ResBody>, crate::Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<http::Response<ResBody>, crate::Error>> + Send + 'a>>;
 
     #[inline]
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -317,7 +319,7 @@ where
 
 // required to use `AsyncInterceptedService` with `Router`
 #[cfg(feature = "transport")]
-impl<S, F> crate::transport::NamedService for AsyncInterceptedService<S, F>
+impl<S, F> crate::transport::NamedService for AsyncInterceptedService<'_, S, F>
     where
         S: crate::transport::NamedService,
 {
