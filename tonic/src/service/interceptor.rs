@@ -4,15 +4,10 @@
 
 use crate::{request::SanitizeHeaders, Status};
 use async_trait::async_trait;
-use futures_util::{FutureExt,};
 use pin_project::pin_project;
-use std::{
-    fmt,
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::{fmt, future::Future, mem, pin::Pin, task::{Context, Poll}};
 use std::marker::PhantomData;
+use http::Uri;
 use tower_layer::Layer;
 use tower_service::Service;
 
@@ -271,11 +266,13 @@ impl<'a, S, F, ReqBody, ResBody> Service<http::Request<ReqBody>> for AsyncInterc
         S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'a,
         S::Error: Into<crate::Error>,
         S::Future: Send,
-        ReqBody: 'a + Send,
+        //S::Future::Output: Result<http::Response<ResBody>, crate::Error>,
+        ReqBody: 'a + Send + Default,
 {
-    type Response = http::Response<ResBody>;
+    type Response = S::Response;
     type Error = crate::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<http::Response<ResBody>, crate::Error>> + Send + 'a>>;
+    type Future = AsyncResponseFuture<S, F::Future, ReqBody>;
+    //type Future = Then<F::Future, ResponseFuture<S::Future>, fn (Result<crate::Request<()>, Status>) -> ResponseFuture<S::Future>>;
 
     #[inline]
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -283,28 +280,28 @@ impl<'a, S, F, ReqBody, ResBody> Service<http::Request<ReqBody>> for AsyncInterc
     }
 
     fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
-        let uri = req.uri().clone();
-        let req = crate::Request::from_http(req);
-        let (metadata, extensions, msg) = req.into_parts();
-
-        let inner = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, inner);
-
-
-
-        Box::pin(self.f
-            .call(crate::Request::from_parts(metadata, extensions, ()))
-            .then(move |intercepted_req| {
-                match intercepted_req {
-                    Ok(req) => {
-                        let (metadata, extensions, _) = req.into_parts();
-                        let req = crate::Request::from_parts(metadata, extensions, msg);
-                        let req = req.into_http(uri, SanitizeHeaders::No);
-                        ResponseFuture::future(inner.call(req))
-                    }
-                    Err(status) => ResponseFuture::error(status),
-                }
-            }))
+        AsyncResponseFuture::new(self.f.clone(), self.inner.clone(), req)
+        // let uri = req.uri().clone();
+        // let req = crate::Request::from_http(req);
+        // let (metadata, extensions, msg) = req.into_parts();
+        //
+        // let inner = self.inner.clone();
+        // let mut inner = std::mem::replace(&mut self.inner, inner);
+        //
+        // self.f
+        //     .call(crate::Request::from_parts(metadata, extensions, ()))
+        //     .then(move |intercepted_req| {
+        //         ResponseFuture::error(Status::invalid_argument("what-EVER!"))
+        //         // match intercepted_req {
+        //         //     Ok(req) => {
+        //         //         let (metadata, extensions, _) = req.into_parts();
+        //         //         let req = crate::Request::from_parts(metadata, extensions, msg);
+        //         //         let req = req.into_http(uri, SanitizeHeaders::No);
+        //         //         ResponseFuture::future(inner.call(req))
+        //         //     }
+        //         //     Err(status) => ResponseFuture::error(status),
+        //         // }
+        //     })
     }
 }
 
@@ -370,6 +367,89 @@ where
                 Poll::Ready(Err(error))
             }
         }
+    }
+}
+
+#[pin_project(project = PinnedOptionProj)]
+#[derive(Debug)]
+enum PinnedOption<F> {
+    Some(#[pin] F),
+    None,
+}
+
+#[pin_project]
+pub struct AsyncResponseFuture<S, I, Msg>
+    where
+        S: Service<http::Request<Msg>>,
+        S::Error: Into<crate::Error>,
+        I: Future<Output = Result<crate::Request<()>, Status>>,
+{
+    #[pin]
+    interceptor_fut: PinnedOption<I>,
+    #[pin]
+    inner_fut: PinnedOption<ResponseFuture<S::Future>>,
+    inner: S,
+    uri: Uri,
+    msg: Msg,
+}
+
+impl<S, I, Msg> AsyncResponseFuture<S, I, Msg>
+    where
+        S: Service<http::Request<Msg>>,
+        S::Error: Into<crate::Error>,
+        I: Future<Output = Result<crate::Request<()>, Status>>,
+{
+    fn new<A: AsyncInterceptor<Future=I>>(mut interceptor: A, inner: S, req: http::Request<Msg>) -> Self {
+        let uri = req.uri().clone();
+        let req = crate::Request::from_http(req);
+        let (metadata, extensions, msg) = req.into_parts();
+
+        let req_without_body = crate::Request::from_parts(metadata, extensions, ());
+        AsyncResponseFuture {
+            interceptor_fut: PinnedOption::Some(interceptor.call(req_without_body)),
+            inner_fut: PinnedOption::None,
+            inner,
+            uri,
+            msg,
+        }
+    }
+}
+
+impl<S, I, Msg, R> Future for AsyncResponseFuture<S, I, Msg>
+    where
+        S: Service<http::Request<Msg>, Response = http::Response<R>>,
+        I: Future<Output = Result<crate::Request<()>, Status>>,
+        S::Error: Into<crate::Error>,
+        S::Future: Future<Output = Result<http::Response<R>, S::Error>>,
+        Msg: Default,
+{
+    type Output = Result<http::Response<R>, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.as_mut().project();
+        if let PinnedOptionProj::Some(f) = this.interceptor_fut.as_mut().project() {
+            match f.poll(cx) {
+                Poll::Ready(intercepted_req) => {
+                    match intercepted_req {
+                        Ok(r) => {
+                            let (metadata, extensions, _) = r.into_parts();
+                            let msg = mem::replace(this.msg, Msg::default());
+                            let req = crate::Request::from_parts(metadata, extensions, msg);
+                            let req = req.into_http(this.uri.clone(), SanitizeHeaders::No);
+                            this.inner_fut.set(PinnedOption::Some(ResponseFuture::future(this.inner.call(req))));
+                            this.interceptor_fut.set(PinnedOption::None);
+                        },
+                        Err(status) => return Poll::Ready(Err(status.into())),
+                    }
+
+                },
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if let PinnedOptionProj::Some(inner_fut) = this.inner_fut.project() {
+            return inner_fut.poll(cx);
+        }
+        panic!()
     }
 }
 
