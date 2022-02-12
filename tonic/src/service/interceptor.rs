@@ -96,6 +96,8 @@ where
     #[pin]
     interceptor_fut: I,
     uri: Uri,
+    http_method: http::Method,
+    http_version: http::Version,
     msg: ReqBody,
 }
 
@@ -108,6 +110,8 @@ where
         req: http::Request<ReqBody>,
     ) -> Self {
         let uri = req.uri().clone();
+        let http_method = req.method().clone();
+        let http_version = req.version().clone();
         let grpc_req = crate::Request::from_http(req);
         let (metadata, extensions, msg) = grpc_req.into_parts();
 
@@ -115,6 +119,8 @@ where
         AsyncInterceptorFuture {
             interceptor_fut: interceptor.call_underlying(req_without_body),
             uri,
+            http_method,
+            http_version,
             msg,
         }
     }
@@ -135,7 +141,12 @@ where
                     let (metadata, extensions, _) = r.into_parts();
                     let msg = mem::replace(this.msg, ReqBody::default());
                     let req = crate::Request::from_parts(metadata, extensions, msg);
-                    let req = req.into_http(this.uri.clone(), SanitizeHeaders::No);
+                    let req = req.into_http(
+                        this.uri.clone(),
+                        this.http_method.clone(),
+                        this.http_version.clone(),
+                        SanitizeHeaders::No,
+                    );
                     Poll::Ready(Ok(req))
                 }
                 Err(status) => Poll::Ready(Err(status.into())),
@@ -278,7 +289,14 @@ where
     }
 
     fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+        // It is bad practice to modify the body (i.e. Message) of the request via an interceptor.
+        // To avoid exposing the body of the request to the interceptor function, we first remove it
+        // here, allow the interceptor to modify the metadata and extensions, and then recreate the
+        // HTTP request with the body. Tonic requests do not preserve the URI, HTTP version, and
+        // HTTP method of the HTTP request, so we extract them here and then add them back in below.
         let uri = req.uri().clone();
+        let method = req.method().clone();
+        let version = req.version().clone();
         let req = crate::Request::from_http(req);
         let (metadata, extensions, msg) = req.into_parts();
 
@@ -289,7 +307,7 @@ where
             Ok(req) => {
                 let (metadata, extensions, _) = req.into_parts();
                 let req = crate::Request::from_parts(metadata, extensions, msg);
-                let req = req.into_http(uri, SanitizeHeaders::No);
+                let req = req.into_http(uri, method, version, SanitizeHeaders::No);
                 ResponseFuture::future(self.inner.call(req))
             }
             Err(status) => ResponseFuture::error(status),
@@ -549,6 +567,22 @@ mod tests {
 
         let request = http::Request::builder()
             .header("user-agent", "test-tonic")
+            .body(hyper::Body::empty())
+            .unwrap();
+
+        svc.oneshot(request).await.unwrap();
+    }
+
+    async fn doesnt_change_http_method() {
+        let svc = tower::service_fn(|request: http::Request<hyper::Body>| async move {
+            assert_eq!(request.method(), http::Method::OPTIONS);
+            Ok::<_, hyper::Error>(hyper::Response::new(hyper::Body::empty()))
+        });
+
+        let svc = InterceptedService::new(svc, |request: crate::Request<()>| Ok(request));
+
+        let request = http::Request::builder()
+            .method(http::Method::OPTIONS)
             .body(hyper::Body::empty())
             .unwrap();
 
